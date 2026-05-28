@@ -94,8 +94,12 @@ def main():
     ap.add_argument("--gpu_index", default="0",
                     help="GPU index as seen by the process (after "
                          "CUDA_VISIBLE_DEVICES masking). Default 0 means "
-                         "'use whatever CUDA_VISIBLE_DEVICES selects'. "
-                         "Pass '-1' to force CPU SIFT.")
+                         "'use whatever CUDA_VISIBLE_DEVICES selects'.")
+    ap.add_argument("--cpu_sift", action="store_true",
+                    help="Force CPU SIFT extraction + matching. Use this if "
+                         "your COLMAP build needs an OpenGL context for "
+                         "GPU SIFT (SiftGPU, COLMAP <= 3.8) and xvfb is "
+                         "not available.")
     ap.add_argument("--fresh", action="store_true",
                     help="delete colmap/ and re-run from scratch")
     args = ap.parse_args()
@@ -118,12 +122,16 @@ def main():
 
     # ---- 1. feature_extractor ----
     if not os.path.exists(database):
-        run([args.colmap_bin, "feature_extractor",
-             "--database_path", database,
-             "--image_path", images_dir,
-             "--ImageReader.single_camera_per_folder", "1",
-             "--ImageReader.camera_model", "OPENCV",
-             "--SiftExtraction.gpu_index", args.gpu_index])
+        cmd = [args.colmap_bin, "feature_extractor",
+               "--database_path", database,
+               "--image_path", images_dir,
+               "--ImageReader.single_camera_per_folder", "1",
+               "--ImageReader.camera_model", "OPENCV"]
+        if args.cpu_sift:
+            cmd += ["--SiftExtraction.use_gpu", "0"]
+        else:
+            cmd += ["--SiftExtraction.gpu_index", args.gpu_index]
+        run(cmd)
 
     # ---- 2. patch DB cameras with real intrinsics ----
     conn = sqlite3.connect(database)
@@ -152,9 +160,12 @@ def main():
     conn.close()
 
     # ---- 3. matcher ----
-    run([args.colmap_bin, "exhaustive_matcher",
-         "--database_path", database,
-         "--SiftMatching.gpu_index", args.gpu_index])
+    cmd = [args.colmap_bin, "exhaustive_matcher", "--database_path", database]
+    if args.cpu_sift:
+        cmd += ["--SiftMatching.use_gpu", "0"]
+    else:
+        cmd += ["--SiftMatching.gpu_index", args.gpu_index]
+    run(cmd)
 
     # ---- 4. write cameras.txt / images.txt / points3D.txt ----
     # vehicle->world pose at the moment THIS specific image was triggered
