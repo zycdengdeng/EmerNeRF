@@ -87,6 +87,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--scene_root", required=True)
     ap.add_argument("--colmap_bin", default="colmap")
+    ap.add_argument("--gpu_index", default="4",
+                    help="GPU index for SIFT extract/match. "
+                         "Comma-separated for multi-GPU, '-1' for CPU.")
     ap.add_argument("--fresh", action="store_true",
                     help="delete colmap/ and re-run from scratch")
     args = ap.parse_args()
@@ -113,7 +116,8 @@ def main():
              "--database_path", database,
              "--image_path", images_dir,
              "--ImageReader.single_camera_per_folder", "1",
-             "--ImageReader.camera_model", "OPENCV"])
+             "--ImageReader.camera_model", "OPENCV",
+             "--SiftExtraction.gpu_index", args.gpu_index])
 
     # ---- 2. patch DB cameras with real intrinsics ----
     conn = sqlite3.connect(database)
@@ -142,7 +146,9 @@ def main():
     conn.close()
 
     # ---- 3. matcher ----
-    run([args.colmap_bin, "exhaustive_matcher", "--database_path", database])
+    run([args.colmap_bin, "exhaustive_matcher",
+         "--database_path", database,
+         "--SiftMatching.gpu_index", args.gpu_index])
 
     # ---- 4. write cameras.txt / images.txt / points3D.txt ----
     # vehicle->world pose at the moment THIS specific image was triggered
