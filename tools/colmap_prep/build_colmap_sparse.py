@@ -80,7 +80,11 @@ def rotmat_to_quat_wxyz(R):
 
 def run(cmd):
     print("$", " ".join(cmd), flush=True)
-    subprocess.run(cmd, check=True)
+    # COLMAP's GPU SIFT pulls in Qt; force offscreen so it doesn't try to open
+    # an X display on headless servers.
+    env = os.environ.copy()
+    env.setdefault("QT_QPA_PLATFORM", "offscreen")
+    subprocess.run(cmd, check=True, env=env)
 
 
 def main():
