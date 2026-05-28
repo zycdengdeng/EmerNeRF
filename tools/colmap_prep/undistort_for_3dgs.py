@@ -54,15 +54,16 @@ def main():
         cmd += ["--max_image_size", str(args.max_image_size)]
     run(cmd)
 
-    # image_undistorter writes sparse/{cameras,images,points3D}.bin flat;
-    # 3DGS expects sparse/0/.
+    # image_undistorter writes sparse/{cameras,images,points3D}.bin flat.
+    # MVS (patch_match_stereo) reads from that flat layout, 3DGS reads from
+    # sparse/0/. Keep both: leave originals in place, copy into sparse/0/.
     sparse_flat = os.path.join(dense_dir, "sparse")
     sparse_zero = os.path.join(sparse_flat, "0")
     os.makedirs(sparse_zero, exist_ok=True)
     for f in ["cameras.bin", "images.bin", "points3D.bin"]:
         src = os.path.join(sparse_flat, f)
         if os.path.exists(src):
-            shutil.move(src, os.path.join(sparse_zero, f))
+            shutil.copy2(src, os.path.join(sparse_zero, f))
 
     print(f"\n[OK] 3DGS-ready data at:")
     print(f"     images: {os.path.join(dense_dir, 'images')}")
