@@ -87,9 +87,11 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--scene_root", required=True)
     ap.add_argument("--colmap_bin", default="colmap")
-    ap.add_argument("--gpu_index", default="4",
-                    help="GPU index for SIFT extract/match. "
-                         "Comma-separated for multi-GPU, '-1' for CPU.")
+    ap.add_argument("--gpu_index", default="0",
+                    help="GPU index as seen by the process (after "
+                         "CUDA_VISIBLE_DEVICES masking). Default 0 means "
+                         "'use whatever CUDA_VISIBLE_DEVICES selects'. "
+                         "Pass '-1' to force CPU SIFT.")
     ap.add_argument("--fresh", action="store_true",
                     help="delete colmap/ and re-run from scratch")
     args = ap.parse_args()
