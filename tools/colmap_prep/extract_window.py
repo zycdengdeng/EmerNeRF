@@ -29,14 +29,14 @@ from waymo_open_dataset import dataset_pb2
 WANT_CAMS = [1, 2, 3]
 CAM_NAME_TO_LOCAL_ID = {1: 0, 2: 1, 3: 2}
 LOCAL_ID_TO_LABEL = {0: "FRONT", 1: "FRONT_LEFT", 2: "FRONT_RIGHT"}
-WINDOW_LEN = 20
 
 
 def mat44(transform):
     return np.asarray(transform, dtype=np.float64).reshape(4, 4).tolist()
 
 
-def process_one(scene_name, start_frame, data_root, out_root, overwrite):
+def process_one(scene_name, start_frame, window_len, data_root, out_root,
+                overwrite):
     scene_out = os.path.join(out_root, scene_name)
     meta_path = os.path.join(scene_out, "selection_meta.json")
     if not overwrite and os.path.exists(meta_path):
@@ -46,7 +46,7 @@ def process_one(scene_name, start_frame, data_root, out_root, overwrite):
         os.makedirs(os.path.join(img_dir, f"cam{c}"), exist_ok=True)
 
     tfpath = os.path.join(data_root, scene_name + ".tfrecord")
-    end_frame = start_frame + WINDOW_LEN
+    end_frame = start_frame + window_len
     cameras_info = None
     frames_meta = []
 
@@ -120,13 +120,17 @@ def main():
     ap.add_argument("--selection", default="tools/colmap_prep/selection.json")
     ap.add_argument("--data_root", default="data/waymo/raw")
     ap.add_argument("--out_root", default="data/waymo/colmap_input")
+    ap.add_argument("--window_len", type=int, default=20,
+                    help="number of consecutive frames to extract per scene")
     ap.add_argument("--overwrite", action="store_true")
     args = ap.parse_args()
 
     sel = json.load(open(args.selection))
-    print(f"Will process {len(sel)} scenes -> {args.out_root}")
+    print(f"Will process {len(sel)} scenes (window={args.window_len}) "
+          f"-> {args.out_root}")
     for scene_name, start in tqdm(list(sel.items()), desc="scenes"):
-        msg = process_one(scene_name, int(start), args.data_root, args.out_root, args.overwrite)
+        msg = process_one(scene_name, int(start), args.window_len,
+                          args.data_root, args.out_root, args.overwrite)
         tqdm.write(msg)
 
 
