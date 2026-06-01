@@ -25,24 +25,26 @@ import tensorflow as tf
 from tqdm import tqdm
 from waymo_open_dataset import dataset_pb2
 
-# Waymo CameraName: 1=FRONT, 2=FRONT_LEFT, 3=FRONT_RIGHT
-WANT_CAMS = [1, 2, 3]
-CAM_NAME_TO_LOCAL_ID = {1: 0, 2: 1, 3: 2}
-LOCAL_ID_TO_LABEL = {0: "FRONT", 1: "FRONT_LEFT", 2: "FRONT_RIGHT"}
+# Waymo CameraName: 1=FRONT, 2=FRONT_LEFT, 3=FRONT_RIGHT, 4=SIDE_LEFT, 5=SIDE_RIGHT
+LOCAL_ID_TO_WAYMO_NAME = {0: 1, 1: 2, 2: 3, 3: 4, 4: 5}
+LOCAL_ID_TO_LABEL = {0: "FRONT", 1: "FRONT_LEFT", 2: "FRONT_RIGHT",
+                     3: "SIDE_LEFT", 4: "SIDE_RIGHT"}
 
 
 def mat44(transform):
     return np.asarray(transform, dtype=np.float64).reshape(4, 4).tolist()
 
 
-def process_one(scene_name, start_frame, window_len, data_root, out_root,
-                overwrite):
+def process_one(scene_name, start_frame, window_len, cam_local_ids,
+                data_root, out_root, overwrite):
+    # Map: waymo CameraName -> our local id
+    waymo_name_to_local = {LOCAL_ID_TO_WAYMO_NAME[i]: i for i in cam_local_ids}
     scene_out = os.path.join(out_root, scene_name)
     meta_path = os.path.join(scene_out, "selection_meta.json")
     if not overwrite and os.path.exists(meta_path):
         return f"skip (exists): {scene_name}"
     img_dir = os.path.join(scene_out, "images")
-    for c in [0, 1, 2]:
+    for c in cam_local_ids:
         os.makedirs(os.path.join(img_dir, f"cam{c}"), exist_ok=True)
 
     tfpath = os.path.join(data_root, scene_name + ".tfrecord")
@@ -62,9 +64,9 @@ def process_one(scene_name, start_frame, window_len, data_root, out_root,
         if cameras_info is None:
             cameras_info = {}
             for calib in frame.context.camera_calibrations:
-                if calib.name not in WANT_CAMS:
+                if calib.name not in waymo_name_to_local:
                     continue
-                local_id = CAM_NAME_TO_LOCAL_ID[calib.name]
+                local_id = waymo_name_to_local[calib.name]
                 cameras_info[local_id] = {
                     "cam_id": local_id,
                     "label": LOCAL_ID_TO_LABEL[local_id],
@@ -78,9 +80,9 @@ def process_one(scene_name, start_frame, window_len, data_root, out_root,
         local_idx = frame_idx - start_frame
         per_image = []
         for img in frame.images:
-            if img.name not in WANT_CAMS:
+            if img.name not in waymo_name_to_local:
                 continue
-            local_cam = CAM_NAME_TO_LOCAL_ID[img.name]
+            local_cam = waymo_name_to_local[img.name]
             outp = os.path.join(img_dir, f"cam{local_cam}", f"{local_idx:03d}.jpg")
             with open(outp, "wb") as fp:
                 fp.write(img.image)
@@ -122,15 +124,26 @@ def main():
     ap.add_argument("--out_root", default="data/waymo/colmap_input")
     ap.add_argument("--window_len", type=int, default=20,
                     help="number of consecutive frames to extract per scene")
+    ap.add_argument("--cams", default="0,1,2",
+                    help="comma-separated local camera ids. "
+                         "0=FRONT 1=FRONT_LEFT 2=FRONT_RIGHT "
+                         "3=SIDE_LEFT 4=SIDE_RIGHT. "
+                         "default '0,1,2' = front three.")
     ap.add_argument("--overwrite", action="store_true")
     args = ap.parse_args()
 
+    cam_local_ids = [int(x) for x in args.cams.split(",") if x.strip() != ""]
+    for c in cam_local_ids:
+        if c not in LOCAL_ID_TO_WAYMO_NAME:
+            raise SystemExit(f"invalid cam id {c}; must be in 0..4")
     sel = json.load(open(args.selection))
-    print(f"Will process {len(sel)} scenes (window={args.window_len}) "
+    print(f"Will process {len(sel)} scenes (window={args.window_len}, "
+          f"cams={[LOCAL_ID_TO_LABEL[c] for c in cam_local_ids]}) "
           f"-> {args.out_root}")
     for scene_name, start in tqdm(list(sel.items()), desc="scenes"):
         msg = process_one(scene_name, int(start), args.window_len,
-                          args.data_root, args.out_root, args.overwrite)
+                          cam_local_ids, args.data_root, args.out_root,
+                          args.overwrite)
         tqdm.write(msg)
 
 
