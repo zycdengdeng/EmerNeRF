@@ -35,7 +35,7 @@ def mat44(transform):
     return np.asarray(transform, dtype=np.float64).reshape(4, 4).tolist()
 
 
-def process_one(scene_name, start_frame, window_len, cam_local_ids,
+def process_one(scene_name, start_frame, window_len, stride, cam_local_ids,
                 data_root, out_root, overwrite):
     # Map: waymo CameraName -> our local id
     waymo_name_to_local = {LOCAL_ID_TO_WAYMO_NAME[i]: i for i in cam_local_ids}
@@ -48,7 +48,9 @@ def process_one(scene_name, start_frame, window_len, cam_local_ids,
         os.makedirs(os.path.join(img_dir, f"cam{c}"), exist_ok=True)
 
     tfpath = os.path.join(data_root, scene_name + ".tfrecord")
-    end_frame = start_frame + window_len
+    # Frames we want: start, start+stride, start+2*stride, ..., (window_len entries)
+    target_frames = {start_frame + i * stride for i in range(window_len)}
+    last_frame = start_frame + (window_len - 1) * stride
     cameras_info = None
     frames_meta = []
 
@@ -56,8 +58,10 @@ def process_one(scene_name, start_frame, window_len, cam_local_ids,
     for frame_idx, data in enumerate(dataset):
         if frame_idx < start_frame:
             continue
-        if frame_idx >= end_frame:
+        if frame_idx > last_frame:
             break
+        if frame_idx not in target_frames:
+            continue
         frame = dataset_pb2.Frame()
         frame.ParseFromString(bytearray(data.numpy()))
 
@@ -77,7 +81,7 @@ def process_one(scene_name, start_frame, window_len, cam_local_ids,
                     "extrinsic_cam_to_vehicle_flu": mat44(calib.extrinsic.transform),
                 }
 
-        local_idx = frame_idx - start_frame
+        local_idx = (frame_idx - start_frame) // stride
         per_image = []
         for img in frame.images:
             if img.name not in waymo_name_to_local:
@@ -103,18 +107,22 @@ def process_one(scene_name, start_frame, window_len, cam_local_ids,
         })
 
     if not frames_meta:
-        return f"FAIL: {scene_name} (no frames in [{start_frame}, {end_frame}))"
+        return (f"FAIL: {scene_name} (no frames matched in "
+                f"[{start_frame}..{last_frame}] stride={stride})")
 
     meta = {
         "scene": scene_name,
         "start_frame": int(start_frame),
+        "stride": int(stride),
         "num_frames": len(frames_meta),
         "cameras": [cameras_info[c] for c in sorted(cameras_info)],
         "frames": frames_meta,
     }
     with open(meta_path, "w") as f:
         json.dump(meta, f, indent=2)
-    return f"done: {scene_name} (frames {start_frame}..{start_frame+len(frames_meta)-1})"
+    extracted_global = [f["global_idx"] for f in frames_meta]
+    return (f"done: {scene_name} (global_idx={extracted_global[0]}..."
+            f"{extracted_global[-1]} stride={stride} n={len(frames_meta)})")
 
 
 def main():
@@ -123,7 +131,11 @@ def main():
     ap.add_argument("--data_root", default="data/waymo/raw")
     ap.add_argument("--out_root", default="data/waymo/colmap_input")
     ap.add_argument("--window_len", type=int, default=20,
-                    help="number of consecutive frames to extract per scene")
+                    help="number of frames to extract per scene "
+                         "(after applying --stride)")
+    ap.add_argument("--stride", type=int, default=1,
+                    help="frame stride. With stride=4 and window_len=8 we "
+                         "grab global frames start, start+4, ..., start+28")
     ap.add_argument("--cams", default="0,1,2",
                     help="comma-separated local camera ids. "
                          "0=FRONT 1=FRONT_LEFT 2=FRONT_RIGHT "
@@ -137,13 +149,14 @@ def main():
         if c not in LOCAL_ID_TO_WAYMO_NAME:
             raise SystemExit(f"invalid cam id {c}; must be in 0..4")
     sel = json.load(open(args.selection))
-    print(f"Will process {len(sel)} scenes (window={args.window_len}, "
+    print(f"Will process {len(sel)} scenes (window_len={args.window_len}, "
+          f"stride={args.stride}, "
           f"cams={[LOCAL_ID_TO_LABEL[c] for c in cam_local_ids]}) "
           f"-> {args.out_root}")
     for scene_name, start in tqdm(list(sel.items()), desc="scenes"):
         msg = process_one(scene_name, int(start), args.window_len,
-                          cam_local_ids, args.data_root, args.out_root,
-                          args.overwrite)
+                          args.stride, cam_local_ids,
+                          args.data_root, args.out_root, args.overwrite)
         tqdm.write(msg)
 
 
