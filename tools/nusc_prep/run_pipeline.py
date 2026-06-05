@@ -77,6 +77,46 @@ def parse_model_analyzer(sparse_dir):
     return reg, pts, err
 
 
+def gpu_used_mb(gpu_idx, timeout=5):
+    """Return memory.used in MB for physical GPU gpu_idx. -1 on error."""
+    try:
+        r = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.used",
+             "--format=csv,noheader,nounits", "-i", str(gpu_idx)],
+            capture_output=True, text=True, timeout=timeout)
+        first = r.stdout.strip().split("\n")[0].strip()
+        return int(first)
+    except Exception:
+        return -1
+
+
+def find_free_gpu(gpus, busy_threshold_mb, exclude=None,
+                  wait_timeout=1800, wait_interval=30):
+    """Block until one GPU in `gpus` reports memory.used < threshold,
+    skipping anything in `exclude`. Returns gpu (str) or None on timeout."""
+    exclude = set(exclude or [])
+    deadline = time.time() + wait_timeout
+    notified = False
+    while True:
+        for g in gpus:
+            if g in exclude:
+                continue
+            u = gpu_used_mb(int(g))
+            if 0 <= u < busy_threshold_mb:
+                if notified:
+                    print(f"  [GPU free again] {g} used={u}MB", flush=True)
+                return g
+        if time.time() >= deadline:
+            return None
+        if not notified:
+            usage = {g: gpu_used_mb(int(g)) for g in gpus if g not in exclude}
+            print(f"  [wait GPU] no free in {gpus} (excl={sorted(exclude)} "
+                  f"thresh={busy_threshold_mb}MB); current usage MB={usage}; "
+                  f"polling every {wait_interval}s", flush=True)
+            notified = True
+        time.sleep(wait_interval)
+
+
 def list_clip_dirs(out_root):
     if not os.path.isdir(out_root):
         return []
@@ -141,28 +181,56 @@ def stage_extract(args, scenes, extrinsic_dir, overwrite=False):
 
 # -------------------- stage: sfm (per clip with retry) --------------------
 
-def build_one_clip(clip_dir, sfm_gpu, max_attempts, max_err):
-    env = os.environ.copy()
-    env["CUDA_VISIBLE_DEVICES"] = str(sfm_gpu)
+def build_one_clip(clip_dir, sfm_gpu_pref, gpu_fallback_pool,
+                   busy_threshold_mb, gpu_wait_timeout,
+                   max_attempts, max_err):
+    """SfM one clip with auto GPU rotation.
+
+    Try the preferred GPU first; if it's contested (used > threshold) or the
+    build fails, taint it and try the next free GPU from gpu_fallback_pool.
+    `tainted` resets each clip (a GPU "tainted" for clip A can still serve
+    clip B fine -- might've just been transiently contested)."""
     name = os.path.basename(clip_dir)
-    ok, reason, _ = sfm_ok(clip_dir, max_err)
+    ok, _, _ = sfm_ok(clip_dir, max_err)
     if ok:
         print(f"  skip (already ok): {name}", flush=True)
         return True
+
+    # Build the candidate order: preferred first, then the pool (dedup)
+    seen = set()
+    candidates = []
+    for g in [str(sfm_gpu_pref)] + list(gpu_fallback_pool):
+        g = str(g)
+        if g and g not in seen:
+            seen.add(g); candidates.append(g)
+
+    tainted = set()
     for attempt in range(1, max_attempts + 1):
-        print(f"  build attempt {attempt}/{max_attempts}: {name}", flush=True)
+        gpu = find_free_gpu(candidates, busy_threshold_mb,
+                            exclude=tainted, wait_timeout=gpu_wait_timeout)
+        if gpu is None:
+            print(f"  [no free GPU within {gpu_wait_timeout}s] giving up "
+                  f"on {name}", flush=True)
+            return False
+        env = os.environ.copy()
+        env["CUDA_VISIBLE_DEVICES"] = gpu
+        print(f"  build attempt {attempt}/{max_attempts} on GPU {gpu} "
+              f"(used={gpu_used_mb(int(gpu))}MB): {name}", flush=True)
         try:
             subprocess.run(
                 [sys.executable, BUILD, "--clip_root", clip_dir, "--fresh"],
                 check=True, env=env)
         except subprocess.CalledProcessError as e:
-            print(f"    [crash rc={e.returncode}]", flush=True)
+            print(f"    [crash rc={e.returncode}] taint GPU {gpu}",
+                  flush=True)
+            tainted.add(gpu)
             continue
         ok, reason, err = sfm_ok(clip_dir, max_err)
         if ok:
             print(f"    [ok] err={err}", flush=True)
             return True
-        print(f"    [below threshold] {reason}", flush=True)
+        print(f"    [below threshold] {reason}; taint GPU {gpu}", flush=True)
+        tainted.add(gpu)
     print(f"  [GIVE UP] {name}", flush=True)
     return False
 
@@ -173,10 +241,13 @@ def stage_sfm_smoke(args):
     clips = list_clip_dirs(args.out_root)[:2]
     if len(clips) < 2:
         sys.exit("need at least 2 clips for smoke test")
+    gpu_pool = [g.strip() for g in args.gpus.split(",") if g.strip()]
     errs = []
     for d in clips:
-        build_one_clip(d, args.sfm_gpu, args.sfm_max_attempts, 1000.0)
-        _, _, err = sfm_ok(d, 1000.0)   # we only want the err here
+        build_one_clip(d, args.sfm_gpu, gpu_pool,
+                       args.gpu_busy_threshold_mb, args.gpu_wait_timeout,
+                       args.sfm_max_attempts, 1000.0)
+        _, _, err = sfm_ok(d, 1000.0)
         errs.append(err if err is not None else 1e6)
     print(f"\nSmoke test errors: {errs}", flush=True)
     return errs
@@ -184,8 +255,10 @@ def stage_sfm_smoke(args):
 
 def stage_sfm_rest(args):
     banner("Stage 2b: SfM for remaining clips")
+    gpu_pool = [g.strip() for g in args.gpus.split(",") if g.strip()]
     for d in list_clip_dirs(args.out_root):
-        build_one_clip(d, args.sfm_gpu,
+        build_one_clip(d, args.sfm_gpu, gpu_pool,
+                       args.gpu_busy_threshold_mb, args.gpu_wait_timeout,
                        args.sfm_max_attempts, args.sfm_max_err)
 
 
@@ -239,9 +312,9 @@ def stage_undistort(args, failed_set):
 # -------------------- stage: mvs (inline GPU pool) --------------------
 
 def stage_mvs(args, failed_set):
-    banner("Stage 5: MVS (GPU pool)")
+    banner("Stage 5: MVS (GPU pool with contention awareness)")
     gpus = [g.strip() for g in args.gpus.split(",") if g.strip()]
-    print(f"GPUs: {gpus}", flush=True)
+    print(f"GPUs pool: {gpus}", flush=True)
 
     for attempt in range(1, args.mvs_max_attempts + 1):
         pending = []
@@ -259,33 +332,20 @@ def stage_mvs(args, failed_set):
             return
         print(f"\nMVS wave {attempt}/{args.mvs_max_attempts}: "
               f"{len(pending)} clips pending\n", flush=True)
-        run_mvs_pool(pending, gpus, args.mvs_max_image_size)
+        run_mvs_pool(pending, gpus, args.mvs_max_image_size,
+                     args.gpu_busy_threshold_mb)
 
 
-def run_mvs_pool(pending, gpus, max_image_size):
+def run_mvs_pool(pending, gpus, max_image_size, busy_threshold_mb):
+    """Dispatch one clip per free GPU. A GPU is 'free' if memory.used <
+    threshold AND we don't already have a job there. If a clip fails
+    (rc != 0), it goes back into the queue (next wave handles it; the
+    contention awareness will naturally avoid GPUs occupied by neighbours)."""
     queue = deque(pending)
-    workers = {g: None for g in gpus}
-
-    def launch(gpu):
-        if not queue:
-            return None
-        clip_dir = queue.popleft()
-        log = os.path.join(clip_dir, "mvs.log")
-        cmd = [sys.executable, RUN_MVS,
-               "--scene_root", clip_dir,
-               "--max_image_size", str(max_image_size)]
-        env = os.environ.copy()
-        env["CUDA_VISIBLE_DEVICES"] = gpu
-        fp = open(log, "w")
-        proc = subprocess.Popen(cmd, env=env, stdout=fp,
-                                stderr=subprocess.STDOUT)
-        print(f"  [GPU {gpu}] LAUNCH {os.path.basename(clip_dir)} "
-              f"pid={proc.pid}", flush=True)
-        return (proc, clip_dir, fp, time.time())
+    workers = {}  # gpu -> (proc, clip, fp, t0)
 
     def cleanup(*_):
         for w in workers.values():
-            if w is None: continue
             try: w[0].terminate()
             except Exception: pass
         sys.exit(1)
@@ -293,22 +353,61 @@ def run_mvs_pool(pending, gpus, max_image_size):
     signal.signal(signal.SIGINT, cleanup)
     signal.signal(signal.SIGTERM, cleanup)
 
-    while queue or any(workers[g] for g in gpus):
+    no_free_logged = False
+    while queue or workers:
+        # Dispatch to any free GPU we don't already own
+        dispatched_any = False
         for g in gpus:
-            if workers[g] is None and queue:
-                workers[g] = launch(g)
+            if g in workers:
+                continue
+            if not queue:
+                break
+            u = gpu_used_mb(int(g))
+            if u < 0 or u > busy_threshold_mb:
+                continue  # contested or query failed; try later
+            clip = queue.popleft()
+            log = os.path.join(clip, "mvs.log")
+            cmd = [sys.executable, RUN_MVS,
+                   "--scene_root", clip,
+                   "--max_image_size", str(max_image_size)]
+            env = os.environ.copy()
+            env["CUDA_VISIBLE_DEVICES"] = g
+            fp = open(log, "w")
+            proc = subprocess.Popen(cmd, env=env, stdout=fp,
+                                    stderr=subprocess.STDOUT)
+            workers[g] = (proc, clip, fp, time.time())
+            print(f"  [GPU {g}] LAUNCH {os.path.basename(clip)} "
+                  f"pid={proc.pid} (used={u}MB)", flush=True)
+            dispatched_any = True
+            no_free_logged = False
+
+        if queue and not workers and not dispatched_any:
+            if not no_free_logged:
+                usage = {g: gpu_used_mb(int(g)) for g in gpus}
+                print(f"  [wait MVS] {len(queue)} pending, no free GPU in "
+                      f"{gpus} (thresh={busy_threshold_mb}MB). "
+                      f"current usage MB={usage}; poll 30s", flush=True)
+                no_free_logged = True
+            time.sleep(30)
+            continue
+
         time.sleep(5)
-        for g in gpus:
-            if workers[g] is None: continue
-            proc, clip_dir, fp, t0 = workers[g]
+        # Reap finished
+        for g in list(workers.keys()):
+            proc, clip, fp, t0 = workers[g]
             rc = proc.poll()
-            if rc is None: continue
+            if rc is None:
+                continue
             fp.close()
             dt = (time.time() - t0) / 60
-            ok = "OK" if rc == 0 else f"FAIL(rc={rc})"
-            print(f"  [GPU {g}] FINISH {os.path.basename(clip_dir)} "
-                  f"{ok} ({dt:.1f}min)", flush=True)
-            workers[g] = None
+            if rc == 0:
+                print(f"  [GPU {g}] FINISH {os.path.basename(clip)} "
+                      f"OK ({dt:.1f}min)", flush=True)
+            else:
+                print(f"  [GPU {g}] FINISH {os.path.basename(clip)} "
+                      f"FAIL(rc={rc}) ({dt:.1f}min); back to queue", flush=True)
+                queue.append(clip)
+            del workers[g]
 
 
 # -------------------- summary --------------------
@@ -383,8 +482,15 @@ def main():
                     help="GPU pool for parallel MVS")
     ap.add_argument("--sfm_max_attempts", type=int, default=2)
     ap.add_argument("--sfm_max_err", type=float, default=5.0)
-    ap.add_argument("--mvs_max_attempts", type=int, default=2)
+    ap.add_argument("--mvs_max_attempts", type=int, default=3)
     ap.add_argument("--mvs_max_image_size", type=int, default=1600)
+    ap.add_argument("--gpu_busy_threshold_mb", type=int, default=5000,
+                    help="a GPU with memory.used above this many MB is "
+                         "considered busy (others using it) and will be "
+                         "skipped at dispatch time")
+    ap.add_argument("--gpu_wait_timeout", type=int, default=1800,
+                    help="seconds to wait for any GPU to free up before "
+                         "giving up on a clip (for SfM)")
     ap.add_argument("--start_from",
                     choices=["select", "extract", "sfm", "check",
                              "undistort", "mvs"],
