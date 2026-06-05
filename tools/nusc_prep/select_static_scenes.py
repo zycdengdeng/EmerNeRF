@@ -165,20 +165,31 @@ def main():
 
     print(f"\n{len(rows)} scenes have >= {need_frames} frames", flush=True)
 
-    # Try increasing max_dyn until we get enough scenes
-    tried_dyn = []
-    for dyn in [args.max_dyn] + list(range(args.max_dyn + 1, 6)):
-        tried_dyn.append(dyn)
-        good = filter_and_rank(rows, dyn, args.max_total_turn,
-                               args.max_speed_cv, args.min_len)
+    # Progressive loosening: try strict tiers; fall back to score-rank-top-N.
+    # Each tier widens all three axes together.
+    base = [r for r in rows if r["length"] >= args.min_len]
+    tiers = [
+        (args.max_dyn, args.max_speed_cv,    args.max_total_turn),
+        (max(args.max_dyn, 2), 0.8, 90.0),
+        (max(args.max_dyn, 4), 1.0, 120.0),
+        (max(args.max_dyn, 8), 1.5, 180.0),
+        (10**6, 10**6, 10**6),    # no constraint
+    ]
+    good = []
+    chosen_tier = None
+    for tier_idx, (md, sv, tt) in enumerate(tiers):
+        good = filter_and_rank(rows, md, tt, sv, args.min_len)
         if len(good) >= args.num:
-            print(f"\nUsing max_dyn={dyn}; {len(good)} scenes survive filter.",
-                  flush=True)
+            chosen_tier = (tier_idx, md, sv, tt)
             break
-    else:
-        print(f"\n[WARN] tried max_dyn in {tried_dyn}, "
-              f"could only find {len(good)} scenes (< {args.num}).",
-              flush=True)
+    if chosen_tier is None:
+        # fall back to "ignore filters, just rank everything that has min_len"
+        good = filter_and_rank(rows, 10**6, 10**6, 10**6, args.min_len)
+        chosen_tier = (len(tiers), 10**6, 10**6, 10**6)
+    print(f"\nUsing filter tier {chosen_tier[0]}: "
+          f"max_dyn<={chosen_tier[1]} max_spd_cv<={chosen_tier[2]} "
+          f"max_turn<={chosen_tier[3]}; {len(good)} scenes survive.",
+          flush=True)
 
     print(f"\n{'scene':>6} {'n_fr':>5} {'len_m':>7} {'spd_cv':>7} "
           f"{'turn°':>7} {'n_dyn':>6} {'dyn_m':>8}")
@@ -194,6 +205,15 @@ def main():
     if len(picked) < args.num:
         sys.exit(f"\n[FAIL] only found {len(picked)}/{args.num} "
                  f"scenes meeting criteria")
+
+    # Soft warning if our best picks are still imperfect
+    worst = picked[-1]
+    if worst.get("n_dyn", 0) > 2:
+        print(f"\n[WARN] picks include scenes with up to "
+              f"{worst['n_dyn']} moving objects -- nuScenes is mostly urban, "
+              f"truly static scenes are rare. SfM will still work but "
+              f"dynamic objects will show as outliers in dense reconstruction.",
+              flush=True)
 
     os.makedirs(os.path.dirname(os.path.abspath(args.out)) or ".", exist_ok=True)
     out_obj = {"selected": [r["scene"] for r in picked],
