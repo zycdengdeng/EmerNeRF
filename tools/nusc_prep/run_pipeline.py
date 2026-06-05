@@ -254,12 +254,106 @@ def stage_sfm_smoke(args):
 
 
 def stage_sfm_rest(args):
-    banner("Stage 2b: SfM for remaining clips")
+    banner("Stage 2b: SfM for remaining clips (GPU pool)")
     gpu_pool = [g.strip() for g in args.gpus.split(",") if g.strip()]
+    pending = []
     for d in list_clip_dirs(args.out_root):
-        build_one_clip(d, args.sfm_gpu, gpu_pool,
-                       args.gpu_busy_threshold_mb, args.gpu_wait_timeout,
-                       args.sfm_max_attempts, args.sfm_max_err)
+        ok, _, _ = sfm_ok(d, args.sfm_max_err)
+        if ok:
+            print(f"  skip (already ok): {os.path.basename(d)}", flush=True)
+            continue
+        pending.append(d)
+    if not pending:
+        print("nothing pending.", flush=True)
+        return
+    print(f"\n{len(pending)} clips pending across {len(gpu_pool)} GPUs\n",
+          flush=True)
+    run_sfm_pool(pending, gpu_pool, args.gpu_busy_threshold_mb,
+                 args.sfm_max_attempts, args.sfm_max_err)
+
+
+def run_sfm_pool(clips, gpus, busy_threshold_mb, max_attempts, max_err):
+    """Parallel SfM across GPU pool. Same contention-aware dispatch as MVS.
+    On failure or quality-below-threshold, re-enqueue with attempt counter."""
+    queue = deque((c, 0) for c in clips)
+    workers = {}  # gpu -> (proc, clip, attempt, fp, t0)
+
+    def cleanup(*_):
+        for w in workers.values():
+            try: w[0].terminate()
+            except Exception: pass
+        sys.exit(1)
+
+    signal.signal(signal.SIGINT, cleanup)
+    signal.signal(signal.SIGTERM, cleanup)
+
+    no_free_logged = False
+    while queue or workers:
+        dispatched = False
+        for g in gpus:
+            if g in workers:
+                continue
+            if not queue:
+                break
+            u = gpu_used_mb(int(g))
+            if u < 0 or u > busy_threshold_mb:
+                continue
+            clip, attempt = queue.popleft()
+            log = os.path.join(clip, f"sfm_attempt{attempt + 1}.log")
+            cmd = [sys.executable, BUILD,
+                   "--clip_root", clip, "--fresh"]
+            env = os.environ.copy()
+            env["CUDA_VISIBLE_DEVICES"] = g
+            fp = open(log, "w")
+            proc = subprocess.Popen(cmd, env=env, stdout=fp,
+                                    stderr=subprocess.STDOUT)
+            workers[g] = (proc, clip, attempt + 1, fp, time.time())
+            print(f"  [GPU {g}] LAUNCH attempt {attempt + 1}/{max_attempts} "
+                  f"{os.path.basename(clip)} pid={proc.pid} (used={u}MB)",
+                  flush=True)
+            dispatched = True
+            no_free_logged = False
+
+        if queue and not workers and not dispatched:
+            if not no_free_logged:
+                usage = {g: gpu_used_mb(int(g)) for g in gpus}
+                print(f"  [wait SfM] {len(queue)} pending, no free GPU in "
+                      f"{gpus} (thresh={busy_threshold_mb}MB). "
+                      f"current usage MB={usage}; poll 30s", flush=True)
+                no_free_logged = True
+            time.sleep(30)
+            continue
+
+        time.sleep(3)
+        finished = []
+        for g in list(workers.keys()):
+            proc, clip, attempt, fp, t0 = workers[g]
+            rc = proc.poll()
+            if rc is None:
+                continue
+            fp.close()
+            dt = (time.time() - t0) / 60
+            ok, reason, err = sfm_ok(clip, max_err)
+            name = os.path.basename(clip)
+            if ok:
+                print(f"  [GPU {g}] FINISH {name} OK err={err} "
+                      f"({dt:.1f}min)", flush=True)
+            else:
+                if rc != 0:
+                    why = f"crash rc={rc}"
+                else:
+                    why = f"below threshold: {reason}"
+                if attempt < max_attempts:
+                    print(f"  [GPU {g}] FINISH {name} {why} ({dt:.1f}min); "
+                          f"requeue (attempt {attempt + 1}/{max_attempts})",
+                          flush=True)
+                    queue.append((clip, attempt))
+                else:
+                    print(f"  [GPU {g}] FINISH {name} {why} ({dt:.1f}min); "
+                          f"GIVE UP", flush=True)
+            finished.append(g)
+        for g in finished:
+            del workers[g]
 
 
 # -------------------- stage: check --------------------
